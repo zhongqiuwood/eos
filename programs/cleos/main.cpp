@@ -151,7 +151,6 @@ FC_DECLARE_EXCEPTION( localized_exception, 10000000, "an error occured" );
 
 string url = "http://localhost:8888/";
 string wallet_url = "http://localhost:8900/";
-int64_t wallet_unlock_timeout = 0;
 bool no_verify = false;
 vector<string> headers;
 
@@ -554,7 +553,9 @@ authority parse_json_authority_or_key(const std::string& authorityJsonOrFile) {
          return authority(public_key_type(authorityJsonOrFile));
       } EOS_RETHROW_EXCEPTIONS(public_key_type_exception, "Invalid public key: ${public_key}", ("public_key", authorityJsonOrFile))
    } else {
-      return parse_json_authority(authorityJsonOrFile);
+      auto result = parse_json_authority(authorityJsonOrFile);
+      EOS_ASSERT( eosio::chain::validate(result), authority_type_exception, "Authority failed validation! ensure that keys, accounts, and waits are sorted and that the threshold is valid and satisfiable!");
+      return result;
    }
 }
 
@@ -714,7 +715,7 @@ void ensure_keosd_running(CLI::App* app) {
     if (app->get_subcommand("create")->got_subcommand("key")) // create key does not require wallet
        return;
     if (auto* subapp = app->get_subcommand("system")) {
-       if (subapp->got_subcommand("listproducers") || subapp->got_subcommand("listbw")) // system list* do not require wallet
+       if (subapp->got_subcommand("listproducers") || subapp->got_subcommand("listbw") || subapp->got_subcommand("bidnameinfo")) // system list* do not require wallet
          return;
     }
 
@@ -745,9 +746,6 @@ void ensure_keosd_running(CLI::App* app) {
 
         vector<std::string> pargs;
         pargs.push_back("--http-server-address=" + lo_address + ":" + std::to_string(resolved_url.resolved_port));
-        if (wallet_unlock_timeout > 0) {
-            pargs.push_back("--unlock-timeout=" + fc::to_string(wallet_unlock_timeout));
-        }
 
         ::boost::process::child keos(binPath, pargs,
                                      bp::std_in.close(),
@@ -827,7 +825,7 @@ struct create_account_subcommand {
          createAccount->add_option("--stake-cpu", stake_cpu,
                                    (localized("The amount of EOS delegated for CPU bandwidth")))->required();
          createAccount->add_option("--buy-ram-kbytes", buy_ram_bytes_in_kbytes,
-                                   (localized("The amount of RAM bytes to purchase for the new account in kilobytes KiB, default is 8 KiB")));
+                                   (localized("The amount of RAM bytes to purchase for the new account in kibibytes (KiB), default is 8 KiB")));
          createAccount->add_option("--buy-ram", buy_ram_eos,
                                    (localized("The amount of RAM bytes to purchase for the new account in EOS")));
          createAccount->add_flag("--transfer", transfer,
@@ -1323,8 +1321,10 @@ void get_account( const string& accountName, bool json_format ) {
    auto res = json.as<eosio::chain_apis::read_only::get_account_results>();
 
    if (!json_format) {
-      if(res.privileged) std::cout << "privileged: true" << std::endl;
+      asset staked;
+      asset unstaking;
 
+      if(res.privileged) std::cout << "privileged: true" << std::endl;
 
       constexpr size_t indent_size = 5;
       const string indent(indent_size, ' ');
@@ -1371,7 +1371,7 @@ void get_account( const string& accountName, bool json_format ) {
          dfs_print( r, 0 );
       }
 
-      auto to_pretty_net = []( int64_t nbytes ) {
+      auto to_pretty_net = []( int64_t nbytes, uint8_t width_for_units = 5 ) {
          if(nbytes == -1) {
              // special case. Treat it as unlimited
              return std::string("unlimited");
@@ -1380,21 +1380,24 @@ void get_account( const string& accountName, bool json_format ) {
          string unit = "bytes";
          double bytes = static_cast<double> (nbytes);
          if (bytes >= 1024 * 1024 * 1024 * 1024ll) {
-             unit = "Tb";
+             unit = "TiB";
              bytes /= 1024 * 1024 * 1024 * 1024ll;
          } else if (bytes >= 1024 * 1024 * 1024) {
-             unit = "Gb";
+             unit = "GiB";
              bytes /= 1024 * 1024 * 1024;
          } else if (bytes >= 1024 * 1024) {
-             unit = "Mb";
+             unit = "MiB";
              bytes /= 1024 * 1024;
          } else if (bytes >= 1024) {
-             unit = "Kb";
+             unit = "KiB";
              bytes /= 1024;
          }
          std::stringstream ss;
          ss << setprecision(4);
-         ss << bytes << " " << std::left << setw(5) << unit;
+         ss << bytes << " ";
+         if( width_for_units > 0 )
+            ss << std::left << setw( width_for_units );
+         ss << unit;
          return ss.str();
       };
 
@@ -1407,6 +1410,13 @@ void get_account( const string& accountName, bool json_format ) {
       if ( res.total_resources.is_object() ) {
          if( res.self_delegated_bandwidth.is_object() ) {
             asset net_own =  asset::from_string( res.self_delegated_bandwidth.get_object()["net_weight"].as_string() );
+            staked = net_own;
+
+            if( staked.get_symbol() != unstaking.get_symbol() ) {
+               // Core symbol of nodeos responding to the request is different than core symbol built into cleos
+               unstaking = asset( 0, staked.get_symbol() ); // Correct core symbol for unstaking asset.
+            }
+
             auto net_others = to_asset(res.total_resources.get_object()["net_weight"].as_string()) - net_own;
 
             std::cout << indent << "staked:" << std::setw(20) << net_own
@@ -1422,7 +1432,7 @@ void get_account( const string& accountName, bool json_format ) {
       }
 
 
-      auto to_pretty_time = []( int64_t nmicro ) {
+      auto to_pretty_time = []( int64_t nmicro, uint8_t width_for_units = 5 ) {
          if(nmicro == -1) {
              // special case. Treat it as unlimited
              return std::string("unlimited");
@@ -1430,7 +1440,7 @@ void get_account( const string& accountName, bool json_format ) {
          string unit = "us";
          double micro = static_cast<double>(nmicro);
 
-         if( micro > 1000000*60 ) {
+         if( micro > 1000000*60*60ll ) {
             micro /= 1000000*60*60ll;
             unit = "hr";
          }
@@ -1448,7 +1458,10 @@ void get_account( const string& accountName, bool json_format ) {
          }
          std::stringstream ss;
          ss << setprecision(4);
-         ss << micro<< " " << std::left << setw(5) << unit;
+         ss << micro << " ";
+         if( width_for_units > 0 )
+            ss << std::left << setw( width_for_units );
+         ss << unit;
          return ss.str();
       };
 
@@ -1464,7 +1477,10 @@ void get_account( const string& accountName, bool json_format ) {
       if ( res.total_resources.is_object() ) {
          if( res.self_delegated_bandwidth.is_object() ) {
             asset cpu_own = asset::from_string( res.self_delegated_bandwidth.get_object()["cpu_weight"].as_string() );
+            staked += cpu_own;
+
             auto cpu_others = to_asset(res.total_resources.get_object()["cpu_weight"].as_string()) - cpu_own;
+
             std::cout << indent << "staked:" << std::setw(20) << cpu_own
                       << std::string(11, ' ') << "(total stake delegated from account to self)" << std::endl
                       << indent << "delegated:" << std::setw(17) << cpu_others
@@ -1483,6 +1499,41 @@ void get_account( const string& accountName, bool json_format ) {
       std::cout << indent << std::left << std::setw(11) << "limit:"     << std::right << std::setw(18) << to_pretty_time( res.cpu_limit.max ) << "\n";
       std::cout << std::endl;
 
+      if( res.refund_request.is_object() ) {
+         auto obj = res.refund_request.get_object();
+         auto request_time = fc::time_point_sec::from_iso_string( obj["request_time"].as_string() );
+         fc::time_point refund_time = request_time + fc::days(3);
+         auto now = res.head_block_time;
+         std::cout << std::fixed << setprecision(3);
+         std::cout << "unstaking tokens:" << std::endl;
+         std::cout << indent << std::left << std::setw(25) << "time of unstake request:" << std::right << std::setw(20) << string(request_time);
+         if( now >= refund_time ) {
+            std::cout << " (available to claim now with 'eosio::refund' action)\n";
+         } else {
+            std::cout << " (funds will be available in " << to_pretty_time( (refund_time - now).count(), 0 ) << ")\n";
+
+            asset net = asset::from_string( obj["net_amount"].as_string() );
+            asset cpu = asset::from_string( obj["cpu_amount"].as_string() );
+            unstaking = net + cpu;
+
+            std::cout << indent << std::left << std::setw(25) << "from net bandwidth:" << std::right << std::setw(18) << net << std::endl;
+            std::cout << indent << std::left << std::setw(25) << "from cpu bandwidth:" << std::right << std::setw(18) << cpu << std::endl;
+            std::cout << indent << std::left << std::setw(25) << "total:" << std::right << std::setw(18) << unstaking << std::endl;
+         }
+         std::cout << std::endl;
+      }
+
+      if( res.core_liquid_balance.valid() ) {
+         std::cout << res.core_liquid_balance->get_symbol().name() << " balances: " << std::endl;
+         std::cout << indent << std::left << std::setw(11)
+                   << "liquid:" << std::right << std::setw(18) << *res.core_liquid_balance << std::endl;
+         std::cout << indent << std::left << std::setw(11)
+                   << "staked:" << std::right << std::setw(18) << staked << std::endl;
+         std::cout << indent << std::left << std::setw(11)
+                   << "unstaking:" << std::right << std::setw(18) << unstaking << std::endl;
+         std::cout << indent << std::left << std::setw(11) << "total:" << std::right << std::setw(18) << (*res.core_liquid_balance + staked + unstaking) << std::endl;
+         std::cout << std::endl;
+      }
 
       if ( res.voter_info.is_object() ) {
          auto& obj = res.voter_info.get_object();
@@ -2130,7 +2181,6 @@ int main( int argc, char** argv ) {
    auto unlockWallet = wallet->add_subcommand("unlock", localized("Unlock wallet"), false);
    unlockWallet->add_option("-n,--name", wallet_name, localized("The name of the wallet to unlock"));
    unlockWallet->add_option("--password", wallet_pw, localized("The password returned by wallet create"));
-   unlockWallet->add_option( "--unlock-timeout", wallet_unlock_timeout, localized("The timeout for unlocked wallet in seconds"));
    unlockWallet->set_callback([&wallet_name, &wallet_pw] {
       if( wallet_pw.size() == 0 ) {
          std::cout << localized("password: ");
@@ -2161,6 +2211,30 @@ int main( int argc, char** argv ) {
       fc::variants vs = {fc::variant(wallet_name), fc::variant(wallet_key)};
       call(wallet_url, wallet_import_key, vs);
       std::cout << localized("imported private key for: ${pubkey}", ("pubkey", std::string(pubkey))) << std::endl;
+   });
+
+   // remove keys from wallet
+   string wallet_rm_key_str;
+   auto removeKeyWallet = wallet->add_subcommand("remove_key", localized("Remove key from wallet"), false);
+   removeKeyWallet->add_option("-n,--name", wallet_name, localized("The name of the wallet to remove key from"));
+   removeKeyWallet->add_option("key", wallet_rm_key_str, localized("Public key in WIF format to remove"))->required();
+   removeKeyWallet->add_option("--password", wallet_pw, localized("The password returned by wallet create"));
+   removeKeyWallet->set_callback([&wallet_name, &wallet_pw, &wallet_rm_key_str] {
+      if( wallet_pw.size() == 0 ) {
+         std::cout << localized("password: ");
+         fc::set_console_echo(false);
+         std::getline( std::cin, wallet_pw, '\n' );
+         fc::set_console_echo(true);
+      }
+      public_key_type pubkey;
+      try {
+         pubkey = public_key_type( wallet_rm_key_str );
+      } catch (...) {
+         EOS_THROW(public_key_type_exception, "Invalid public key: ${public_key}", ("public_key", wallet_rm_key_str))
+      }
+      fc::variants vs = {fc::variant(wallet_name), fc::variant(wallet_pw), fc::variant(wallet_rm_key_str)};
+      call(wallet_url, wallet_remove_key, vs);
+      std::cout << localized("removed private key for: ${pubkey}", ("pubkey", wallet_rm_key_str)) << std::endl;
    });
 
    // create a key within wallet
